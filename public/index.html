@@ -1967,8 +1967,9 @@ function isInspectVehicle(v){return normCaseType(v).includes('通檢')}
 function getMonthValue(v){
   const direct=Number(v?.month);
   if(Number.isFinite(direct)&&direct>0)return direct;
-  const ds=String(v?.date || v?.datetime || '');
+  const ds=String(v?.date || v?.datetime || '').trim();
   if(ds.includes('-'))return Number(ds.slice(5,7));
+  if(ds.includes('/'))return Number(ds.split('/')[1]);
   if(ds.includes('.'))return Number(ds.split('.')[1]);
   const m=ds.match(/(?:^|[^0-9])(\d{1,2})\s*月/);
   return m?Number(m[1]):null;
@@ -1979,12 +1980,23 @@ function caseStats(rows){
   return {fine,inspect,cases:fine+inspect};
 }
 function scopedVehicles(data,opts={}){
+  const rows=VEHICLES||[];
   const rawRows=Array.isArray(data)?data:[];
-  const months=opts.month!=null?new Set([Number(opts.month)]):new Set(rawRows.map(r=>getMonthValue(r)).filter(Boolean));
-  const districts=opts.district?new Set([opts.district]):new Set(rawRows.map(r=>r.district).filter(Boolean));
+  const hasExplicitScope=opts.month!=null||!!opts.district||!!opts.location;
+  const hasActiveFilter=selectedMonths.size>0||selectedDistricts.size>0;
+  if(!hasExplicitScope&&!hasActiveFilter)return rows;
+  const months=opts.month!=null
+    ? new Set([Number(opts.month)])
+    : selectedMonths.size
+      ? new Set([...selectedMonths].map(Number))
+      : hasExplicitScope ? new Set(rawRows.map(r=>getMonthValue(r)).filter(Boolean)) : new Set();
+  const districts=opts.district
+    ? new Set([opts.district])
+    : selectedDistricts.size
+      ? new Set([...selectedDistricts])
+      : hasExplicitScope ? new Set(rawRows.map(r=>r.district).filter(Boolean)) : new Set();
   const locKey=opts.location?normalizeLocationKey(opts.location):'';
-  const hasRawScope=rawRows.length>0;
-  return (VEHICLES||[]).filter(v=>{
+  return rows.filter(v=>{
     const vm=getMonthValue(v),vd=v.district||'';
     if(months.size && !months.has(vm))return false;
     if(districts.size && !districts.has(vd))return false;
@@ -1992,7 +2004,6 @@ function scopedVehicles(data,opts={}){
       const vl=normalizeLocationKey(v.location||v.road||'');
       if(!(vl.includes(locKey)||locKey.includes(vl)))return false;
     }
-    if(!hasRawScope && (selectedMonths.size||selectedDistricts.size))return (selectedMonths.size===0||selectedMonths.has(vm))&&(selectedDistricts.size===0||selectedDistricts.has(vd));
     return true;
   });
 }

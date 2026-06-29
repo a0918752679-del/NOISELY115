@@ -654,15 +654,29 @@ function hasLineQuery(q){
 }
 function recordMonth(date, fallback){
   if(fallback) return Number(fallback)||0;
-  const m=String(date||'').match(/^\d{4}-(\d{2})-/);
-  return m ? Number(m[1]) : 0;
+  const ds=String(date||'').trim();
+  let m=ds.match(/^\d{4}-(\d{1,2})-/);
+  if(m) return Number(m[1]);
+  m=ds.match(/^\d{4}\/(\d{1,2})\//);
+  if(m) return Number(m[1]);
+  m=ds.match(/^\d{3}\.(\d{1,2})\./);
+  if(m) return Number(m[1]);
+  return 0;
+}
+function recordDateKey(date){
+  const ds=String(date||'').trim();
+  let m=ds.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/);
+  if(m) return `${m[1]}-${String(m[2]).padStart(2,'0')}-${String(m[3]).padStart(2,'0')}`;
+  m=ds.match(/^(\d{3})\.(\d{1,2})\.(\d{1,2})/);
+  if(m) return `${m[1]}.${String(m[2]).padStart(2,'0')}.${String(m[3]).padStart(2,'0')}`;
+  return ds.slice(0,10);
 }
 function filterForLineQuery(data,q){
   let raw=(data.raw||[]).map(mapRawRow);
   let vehicles=(data.vehicles||[]).map(mapVehicleRow);
   if(q.district){ raw=raw.filter(r=>String(r.district||'')===q.district); vehicles=vehicles.filter(v=>String(v.district||'')===q.district); }
   if(q.month){ raw=raw.filter(r=>recordMonth(r.date,r.month)===q.month); vehicles=vehicles.filter(v=>recordMonth(v.date,0)===q.month); }
-  if(q.date){ raw=raw.filter(r=>String(r.date||'').slice(0,10)===q.date); vehicles=vehicles.filter(v=>String(v.date||v.datetime||'').slice(0,10)===q.date); }
+  if(q.date){ raw=raw.filter(r=>recordDateKey(r.date)===q.date); vehicles=vehicles.filter(v=>recordDateKey(v.date||v.datetime)===q.date); }
   if(q.machine){ raw=raw.filter(r=>String(r.machine||'').toUpperCase().replace('-', '_').includes(q.machine)); }
   if(q.plate){ vehicles=vehicles.filter(v=>normalizePlateToken(v.plate).includes(q.plate) || q.plate.includes(normalizePlateToken(v.plate))); raw = q.machine ? raw : raw; }
   return {raw,vehicles,updatedAt:data.updatedAt||''};
