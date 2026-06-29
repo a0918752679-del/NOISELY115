@@ -1,0 +1,9 @@
+{
+  "name": "ntpc-noise-dashboard",
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "run": {
+    "startCommand": "npm start"
+  }
+}
