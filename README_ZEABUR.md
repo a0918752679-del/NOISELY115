@@ -28,3 +28,44 @@ LINE_CHANNEL_SECRET=你的LINE_Channel_Secret
 DASHBOARD_ADMIN_TOKEN=你的管理者Token
 DASHBOARD_EDITOR_TOKEN=你的編輯者Token
 ```
+
+
+## AI 優化版 V1.0 新增功能
+
+本版新增 AI 成效分析助理，可在前台右下角開啟，並提供主管摘要、排場建議、資料健檢、異常清單與自然語言查詢。
+
+### 新增 API
+
+- `GET /api/ai/status`
+- `POST /api/ai/query`
+- `POST /api/ai/report`
+- `POST /api/ai/validate-import`
+- `POST /api/ai/recommend-locations`
+- `POST /api/ai/anomaly-check`
+
+### AI 環境變數
+
+```env
+AI_ENABLED=true
+AI_PROVIDER=openai
+OPENAI_API_KEY=你的OpenAI_API_Key
+AI_MODEL=gpt-4.1-mini
+AI_REQUIRE_ROLE=editor
+AI_MASK_PLATE_FOR_VIEWER=true
+AI_MAX_ROWS=500
+AI_REPORT_DEFAULT_STYLE=主管簡報版
+AI_LOG_ENABLED=true
+```
+
+若尚未設定 OpenAI API Key，請將 `AI_PROVIDER=heuristic`，系統會使用內建規則分析，不會影響 Zeabur 啟動。
+
+### LINE Bot AI 指令
+
+```text
+AI 幫我看本週重點
+AI 建議下週排場
+AI 檢查今天資料有沒有異常
+AI 幫我寫主管摘要
+```
+
+AI 回覆只作決策輔助；正式告發、通檢與裁罰仍以原始資料及承辦複核為準。

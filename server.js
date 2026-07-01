@@ -393,6 +393,157 @@ function requireDashboardRole(required='editor'){
   };
 }
 
+
+// ===== AI decision assistant v1.0 =====
+const AI_ENABLED = String(process.env.AI_ENABLED || 'true').toLowerCase() === 'true';
+const AI_PROVIDER = String(process.env.AI_PROVIDER || (process.env.OPENAI_API_KEY || process.env.AI_API_KEY ? 'openai' : 'heuristic')).toLowerCase();
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.AI_API_KEY || '';
+const AI_MODEL = process.env.AI_MODEL || 'gpt-4.1-mini';
+const AI_REQUIRE_ROLE = process.env.AI_REQUIRE_ROLE || 'editor';
+const AI_MASK_PLATE_FOR_VIEWER = String(process.env.AI_MASK_PLATE_FOR_VIEWER || 'true').toLowerCase() !== 'false';
+const AI_MAX_ROWS = Math.max(50, Math.min(3000, Number(process.env.AI_MAX_ROWS || 500)));
+const AI_LOG_ENABLED = String(process.env.AI_LOG_ENABLED || 'true').toLowerCase() === 'true';
+
+function requireAIRole(req,res,next){
+  if(!AI_ENABLED) return res.status(503).json({ok:false,message:'AI 功能尚未啟用，請設定 AI_ENABLED=true。'});
+  const required = ['viewer','editor','admin'].includes(AI_REQUIRE_ROLE) ? AI_REQUIRE_ROLE : 'editor';
+  if(required === 'viewer') return next();
+  return requireDashboardRole(required)(req,res,next);
+}
+function maskPlate(plate){
+  const p=String(plate||'').trim().toUpperCase();
+  if(p.length<=3) return p ? '***' : '';
+  return `${p.slice(0,2)}***${p.slice(-2)}`;
+}
+function rankDistricts(s, limit=8){
+  return Object.entries(s.byDistrict||{}).map(([district,x])=>({district,...x}))
+    .sort((a,b)=>b.caseTotal-a.caseTotal || b.kpi-a.kpi || b.over-a.over || b.vehicles-a.vehicles)
+    .slice(0,limit);
+}
+function rankMachines(raw, limit=8){
+  return groupRows(raw||[],r=>r.machine,limit).filter(x=>x.name&&x.name!=='未填')
+    .sort((a,b)=>b.caseTotal-a.caseTotal || b.kpi-a.kpi || b.vehicles-a.vehicles).slice(0,limit);
+}
+function buildRecommendations(data, limit=10){
+  const s=summary(data);
+  const districts=Object.entries(s.byDistrict||{}).map(([district,x])=>{
+    const score = Math.round((x.caseTotal*8) + (x.kpi*25) + (x.overRate*1.5) + Math.min(x.vehicles/1000,30) + Math.min(x.sessions,20));
+    const reasons=[];
+    if(x.caseTotal>0) reasons.push(`成案件 ${x.caseTotal} 件`);
+    if(x.kpi>0) reasons.push(`KPI ${x.kpi} 件/場`);
+    if(x.overRate>0) reasons.push(`超標率 ${x.overRate.toFixed(2)}%`);
+    if(x.vehicles>0) reasons.push(`車流 ${nfmt(x.vehicles)}`);
+    const risk=x.sessions>=20 && x.kpi<0.2 ? '場次多但 KPI 偏低，建議檢討時段、架設角度或風速條件。' : (x.sessions<3 ? '資料量偏少，建議先補足樣本後再判斷。' : '可列入下期排場評估。');
+    return {district,score,sessions:x.sessions,vehicles:x.vehicles,over:x.over,fine:x.fine,inspect:x.inspect,caseTotal:x.caseTotal,kpi:x.kpi,overRate:x.overRate,caseRate:x.caseRate,reasons,risk,priority:score>=80?'S':score>=55?'A':score>=30?'B':'C'};
+  }).sort((a,b)=>b.score-a.score || b.caseTotal-a.caseTotal).slice(0,limit);
+  return districts;
+}
+function buildAnomalies(data){
+  const raw=(data.raw||[]).map(mapRawRow);
+  const vehicles=(data.vehicles||[]).map(mapVehicleRow);
+  const issues=[];
+  const seqMap=new Map();
+  for(const r of raw){
+    const key=String(r.seq||'').trim();
+    if(key){
+      const prev=seqMap.get(key);
+      if(prev && (prev.date!==r.date || prev.machine!==r.machine || prev.location!==r.location)) issues.push({level:'yellow',type:'場次編號重複',message:`場次 ${key} 重複，但日期、機台或點位不同，建議匯入後保留警示，不要直接覆蓋。`,ref:key});
+      seqMap.set(key,r);
+    }
+    if(r.completed!==false && Number(r.vehicles||0)===0) issues.push({level:'red',type:'車流為 0',message:`場次 ${r.seq||'-'} 已完成但辨識車流為 0。`,ref:r.seq});
+    if(Number(r.over||0)>0 && Number(r.fineCases||0)+Number(r.inspectCases||0)===0) issues.push({level:'yellow',type:'超標未成案',message:`場次 ${r.seq||'-'} 超標 ${r.over} 件，但告發/通檢為 0，建議複核案件狀態。`,ref:r.seq});
+    if(r.machine && !/(OE[_-]?)?ZB0?([1-9]|10)$/i.test(String(r.machine))) issues.push({level:'yellow',type:'機台編號格式',message:`場次 ${r.seq||'-'} 機台編號 ${r.machine} 非 ZB001～ZB010 常用格式。`,ref:r.seq});
+    if(r.location && r.district && !String(r.location).includes(r.district.replace('區','')) && !String(r.location).startsWith(r.district)) issues.push({level:'yellow',type:'行政區與地址待確認',message:`場次 ${r.seq||'-'} 行政區為 ${r.district}，請確認地址是否一致。`,ref:r.seq});
+  }
+  const plateMap=new Map();
+  for(const v of vehicles){
+    if(!v.plate) issues.push({level:'red',type:'車牌缺漏',message:`${v.date||'-'} ${v.district||''} 有車輛案件缺少車牌。`,ref:v.date});
+    if(v.db && v.standard && Math.abs((v.db-v.standard)-(v.exceed||0))>0.6) issues.push({level:'yellow',type:'超標值不一致',message:`車牌 ${maskPlate(v.plate)} 量測值、標準值與超標值不一致，建議複核。`,ref:v.caseNo||v.plate});
+    if(v.caseType && !/(告發|通檢)/.test(v.caseType)) issues.push({level:'yellow',type:'案件類型待確認',message:`車牌 ${maskPlate(v.plate)} 案件類型為「${v.caseType}」，非告發/通檢常用分類。`,ref:v.caseNo||v.plate});
+    if(v.plate){
+      const key=normalizePlateToken(v.plate);
+      plateMap.set(key,(plateMap.get(key)||0)+1);
+    }
+  }
+  for(const [plate,count] of plateMap.entries()) if(count>=3) issues.push({level:'yellow',type:'高頻車牌',message:`車牌 ${maskPlate(plate)} 於案件明細出現 ${count} 次，可列入複核或追蹤。`,ref:plate});
+  const red=issues.filter(x=>x.level==='red').length;
+  const yellow=issues.filter(x=>x.level==='yellow').length;
+  return {red,yellow,green:Math.max(0,raw.length+vehicles.length-red-yellow),issues:issues.slice(0,80)};
+}
+function buildAIContext(data, options={}){
+  const role=options.role||'viewer';
+  const s=summary(data);
+  const raw=(data.raw||[]).map(mapRawRow).slice(0,AI_MAX_ROWS);
+  const vehicles=(data.vehicles||[]).map(mapVehicleRow).slice(0,AI_MAX_ROWS).map(v=>AI_MASK_PLATE_FOR_VIEWER&&role==='viewer'?{...v,plate:maskPlate(v.plate),caseNo:v.caseNo?'已遮罩':''}:v);
+  return {summary:s,topDistricts:rankDistricts(s,10),topMachines:rankMachines(raw,10),recommendations:buildRecommendations({raw,vehicles},10),anomalies:buildAnomalies({raw,vehicles}),sample:{raw:raw.slice(0,30),vehicles:vehicles.slice(0,30)}};
+}
+function formatRecommendations(recs){
+  if(!recs.length) return '目前資料不足，無法產生排場建議。';
+  return recs.map((x,i)=>`${i+1}. ${x.district}｜${x.priority}級｜分數 ${x.score}｜場次 ${x.sessions}｜成案 ${x.caseTotal}｜KPI ${x.kpi}\n   原因：${x.reasons.join('、')||'資料量不足'}\n   風險：${x.risk}`).join('\n');
+}
+function heuristicReport(data, style='主管簡報版'){
+  const s=summary(data);
+  const top=rankDistricts(s,5);
+  const recs=buildRecommendations(data,5);
+  const anomalies=buildAnomalies(data);
+  const topText=top.map((x,i)=>`${i+1}. ${x.district}：場次 ${x.sessions}、告發 ${x.fine}、通檢 ${x.inspect}、成案 ${x.caseTotal}、KPI ${x.kpi}`).join('\n') || '目前無行政區資料。';
+  const keyFinding=[];
+  if(top[0]) keyFinding.push(`${top[0].district}為目前成案件數最高行政區，成案 ${top[0].caseTotal} 件，KPI ${top[0].kpi} 件/場。`);
+  const lowKpi=top.find(x=>x.sessions>=10 && x.kpi<0.2);
+  if(lowKpi) keyFinding.push(`${lowKpi.district}場次已有 ${lowKpi.sessions} 場但 KPI 偏低，建議檢討架設條件與執行時段。`);
+  if(anomalies.red||anomalies.yellow) keyFinding.push(`資料健檢發現紅色 ${anomalies.red} 件、黃色 ${anomalies.yellow} 件，建議匯出前先複核。`);
+  if(!keyFinding.length) keyFinding.push('目前資料未見明顯異常，可持續觀察行政區與機台 KPI 變化。');
+  return [
+    `AI 成效摘要（${style}）`,
+    '',
+    '一、總體成果',
+    `累計執行 ${s.sessions} 場，完成 ${s.completed} 場；辨識車流 ${nfmt(s.vehicleDetected)} 輛次，超標 ${nfmt(s.over)} 件，告發 ${nfmt(s.fineCases)} 件、通知到檢 ${nfmt(s.inspectCases)} 件，整體成案件數 ${nfmt(s.caseTotal)} 件，場次 KPI ${s.kpi} 件/場。`,
+    '',
+    '二、關鍵判讀',
+    keyFinding.map((x,i)=>`${i+1}. ${x}`).join('\n'),
+    '',
+    '三、行政區重點排行',
+    topText,
+    '',
+    '四、下期排場建議',
+    formatRecommendations(recs),
+    '',
+    '五、風險提醒',
+    anomalies.issues.slice(0,5).map((x,i)=>`${i+1}. [${x.level==='red'?'紅':'黃'}] ${x.message}`).join('\n') || '目前無重大資料異常。',
+    '',
+    `最後更新：${s.updatedAt ? new Date(s.updatedAt).toLocaleString('zh-TW') : '-'}`,
+    '註：本摘要依平台現有資料自動產出，涉及裁罰與正式行政處分仍應以原始表單及承辦複核為準。'
+  ].join('\n');
+}
+async function callOpenAIForText(task, context, question){
+  if(!OPENAI_API_KEY || AI_PROVIDER !== 'openai') return '';
+  const system = '你是新北市噪音車科技執法資料分析助理。只能根據使用者提供的 JSON 資料回答，不得編造數字。輸出繁體中文，分為摘要、關鍵數據、判讀、建議、風險提醒。涉及裁罰與正式行政處分必須提醒仍以承辦複核為準。';
+  const body={model:AI_MODEL,messages:[{role:'system',content:system},{role:'user',content:JSON.stringify({task,question,context})}],temperature:0.2};
+  const res=await fetch('https://api.openai.com/v1/chat/completions',{method:'POST',headers:{Authorization:`Bearer ${OPENAI_API_KEY}`,'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const json=await res.json().catch(()=>({}));
+  if(!res.ok) throw new Error(json?.error?.message || `OpenAI API ${res.status}`);
+  return json?.choices?.[0]?.message?.content || '';
+}
+async function generateAIText(task, data, question='', role='viewer', fallbackStyle='主管簡報版'){
+  const context=buildAIContext(data,{role});
+  if(AI_LOG_ENABLED) console.log('[AI_TASK]',task,{provider:AI_PROVIDER,openai:Boolean(OPENAI_API_KEY),question:String(question||'').slice(0,80)});
+  try{
+    const out=await callOpenAIForText(task, context, question);
+    if(out) return {provider:'openai',text:out,context};
+  }catch(err){
+    console.warn('[AI_OPENAI_FALLBACK]',err.message);
+  }
+  let text='';
+  if(task==='recommend') text=`AI 排場建議\n\n${formatRecommendations(context.recommendations)}\n\n註：此排序依現有資料、成案件數、KPI、超標率、車流與場次量推估，正式排場仍需現勘確認。`;
+  else if(task==='validate') text=`AI 資料健檢\n\n紅色：${context.anomalies.red} 件\n黃色：${context.anomalies.yellow} 件\n可用資料：${context.anomalies.green} 筆\n\n${context.anomalies.issues.slice(0,20).map((x,i)=>`${i+1}. [${x.level==='red'?'紅':'黃'}] ${x.type}：${x.message}`).join('\n') || '目前未發現明顯異常。'}`;
+  else if(task==='query'){
+    const q=parseLineQuery(question||'');
+    if(hasLineQuery(q)) text=lineFilteredMessage(data,q);
+    else text=heuristicReport(data,'AI 問答版');
+  }else text=heuristicReport(data,fallbackStyle);
+  return {provider:'heuristic',text,context};
+}
+
 app.use(express.json({limit:'50mb',verify:(req,res,buf)=>{req.rawBody=buf}}));
 app.use(express.urlencoded({extended:true,limit:'50mb'}));
 app.use(express.static(path.join(__dirname,'public')));
@@ -409,6 +560,7 @@ app.get('/api/health', (req,res)=>res.json({
   googleSheetUrl:GOOGLE_SHEET_URL,
   lineConfigured:Boolean(LINE_CHANNEL_ACCESS_TOKEN && LINE_CHANNEL_SECRET),
   tokenConfigured:Boolean(DASHBOARD_ADMIN_TOKEN || DASHBOARD_EDITOR_TOKEN),
+  ai:{enabled:AI_ENABLED,provider:AI_PROVIDER,model:AI_MODEL,requireRole:AI_REQUIRE_ROLE,openaiConfigured:Boolean(OPENAI_API_KEY)},
   realtimeNote: GOOGLE_AUTO_SYNC && googleSheetConfigured() ? '前台、後台匯出與 LINE Bot 查詢時會即時讀取 Google Sheet。' : '目前未啟用 Google Sheet 即時同步，使用 Zeabur 本地快取。'
 }));
 
@@ -525,6 +677,71 @@ app.get('/api/export/summary-excel', requireDashboardRole('editor'), async (req,
   }catch(err){res.status(500).send(err.message)}
 });
 app.get('/api/summary', async (req,res)=>{try{const data=await getDashboardData();res.json({ok:true,summary:summary(data)})}catch(err){res.status(500).json({ok:false,message:err.message})}});
+
+app.get('/api/ai/status', (req,res)=>res.json({
+  ok:true,
+  enabled:AI_ENABLED,
+  provider:AI_PROVIDER,
+  model:AI_MODEL,
+  openaiConfigured:Boolean(OPENAI_API_KEY),
+  requireRole:AI_REQUIRE_ROLE,
+  maxRows:AI_MAX_ROWS,
+  features:['query','report','validate-import','recommend-locations','anomaly-check']
+}));
+
+app.post('/api/ai/query', requireAIRole, async (req,res)=>{
+  try{
+    const data=await getDashboardData();
+    const role=req.dashboardRole || roleFromToken(getDashboardToken(req));
+    const question=String(req.body?.question || req.body?.q || '').trim();
+    if(!question) throw new Error('請提供 question。');
+    const result=await generateAIText('query',data,question,role,'AI 問答版');
+    res.json({ok:true,provider:result.provider,answer:result.text,summary:result.context.summary});
+  }catch(err){res.status(400).json({ok:false,message:err.message})}
+});
+
+app.post('/api/ai/report', requireAIRole, async (req,res)=>{
+  try{
+    const data=await getDashboardData();
+    const role=req.dashboardRole || roleFromToken(getDashboardToken(req));
+    const style=String(req.body?.style || process.env.AI_REPORT_DEFAULT_STYLE || '主管簡報版');
+    const result=await generateAIText('report',data,`請產出${style}`,role,style);
+    res.json({ok:true,provider:result.provider,style,report:result.text,summary:result.context.summary});
+  }catch(err){res.status(400).json({ok:false,message:err.message})}
+});
+
+app.post('/api/ai/validate-import', requireAIRole, upload.single('file'), async (req,res)=>{
+  try{
+    let data;
+    if(req.file) data=parseWorkbook(req.file.buffer);
+    else if(req.body && (Array.isArray(req.body.raw)||Array.isArray(req.body.vehicles))) data={raw:req.body.raw||[],vehicles:req.body.vehicles||[]};
+    else data=await getDashboardData();
+    const role=req.dashboardRole || roleFromToken(getDashboardToken(req));
+    const context=buildAIContext(data,{role});
+    const result=await generateAIText('validate',data,'請檢查匯入資料異常',role,'資料健檢版');
+    res.json({ok:true,provider:result.provider,validation:context.anomalies,message:result.text});
+  }catch(err){res.status(400).json({ok:false,message:err.message})}
+});
+
+app.post('/api/ai/recommend-locations', requireAIRole, async (req,res)=>{
+  try{
+    const data=await getDashboardData();
+    const role=req.dashboardRole || roleFromToken(getDashboardToken(req));
+    const context=buildAIContext(data,{role});
+    const result=await generateAIText('recommend',data,'請產生下期排場與百大點位排序建議',role,'排場建議版');
+    res.json({ok:true,provider:result.provider,recommendations:context.recommendations,message:result.text});
+  }catch(err){res.status(400).json({ok:false,message:err.message})}
+});
+
+app.post('/api/ai/anomaly-check', requireAIRole, async (req,res)=>{
+  try{
+    const data=await getDashboardData();
+    const role=req.dashboardRole || roleFromToken(getDashboardToken(req));
+    const context=buildAIContext(data,{role});
+    res.json({ok:true,anomalies:context.anomalies,summary:context.summary});
+  }catch(err){res.status(400).json({ok:false,message:err.message})}
+});
+
 const LINE_COMMANDS = [
   '最新進度',
   '執行進度',
@@ -536,7 +753,10 @@ const LINE_COMMANDS = [
   '機號OE_ZB004',
   '車牌ABC-1234',
   '淡水區 6月 告發率',
-  '查詢說明'
+  '查詢說明',
+  'AI 幫我看本週重點',
+  'AI 建議下週排場',
+  'AI 檢查今天資料有沒有異常'
 ];
 
 app.get('/line-webhook',(req,res)=>res.json({
@@ -853,6 +1073,12 @@ app.post('/line-webhook',async(req,res)=>{
           await replyLine(event.replyToken, summaryMessage(data));
         }else if(isHelpCommand(clean)){
           await replyLine(event.replyToken, lineHelpMessage());
+        }else if(/^AI[\s：:]/i.test(clean) || /^(幫我看本週重點|建議下週排場|檢查今天資料有沒有異常|幫我寫主管摘要)$/i.test(clean)){
+          const data = await getDashboardData();
+          const aiQuestion = clean.replace(/^AI[\s：:]*/i,'').trim() || '請產生主管摘要';
+          const task = /排場|點位|建議/.test(aiQuestion) ? 'recommend' : (/異常|檢查|健檢/.test(aiQuestion) ? 'validate' : 'query');
+          const result = await generateAIText(task,data,aiQuestion,'editor','LINE AI 版');
+          await replyLine(event.replyToken, result.text);
         }else{
           const q=parseLineQuery(clean);
           if(hasLineQuery(q)){
